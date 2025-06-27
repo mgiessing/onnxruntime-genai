@@ -24,6 +24,7 @@ from onnxruntime.quantization.matmul_nbits_quantizer import (
     MatMulNBitsQuantizer,
     QuantFormat,
     RTNWeightOnlyQuantConfig,
+    DefaultWeightOnlyQuantConfig,
 )
 from tqdm import tqdm
 from transformers import (
@@ -50,6 +51,8 @@ class Model:
             ir.DataType.BFLOAT16,
             ir.DataType.INT4,
             ir.DataType.UINT4,
+            ir.DataType.INT8,
+            ir.DataType.UINT8,
         ]
         | int,
         ep: str,
@@ -292,6 +295,7 @@ class Model:
 
         # Quantization-specific variables (INT4, INT8, etc.)
         int4_algo_config = self.make_int4_algo_config(extra_options.get("int4_algo_config", "default"))
+        int8_algo_config = self.make_int8_algo_config(extra_options.get("int8_algo_config", "default"))
         self.quant_attrs = {
             "int4": {
                 "accuracy_level": int(extra_options.get("int4_accuracy_level", 4 if self.ep in ["cpu", "webgpu"] else 0)),
@@ -300,6 +304,14 @@ class Model:
                 "op_types_to_quantize": extra_options.get("int4_op_types_to_quantize", ("MatMul", )),
                 "nodes_to_exclude": extra_options.get("int4_nodes_to_exclude", []),
                 "algo_config": int4_algo_config,
+            },
+            "int8": {
+                "accuracy_level": int(extra_options.get("int8_accuracy_level", 4 if self.ep in ["cpu", "webgpu"] else 0)),
+                "block_size": int(extra_options.get("int8_block_size", 32)),
+                "is_symmetric": extra_options.get("int8_is_symmetric", True),
+                "op_types_to_quantize": extra_options.get("int8_op_types_to_quantize", ("MatMul", )),
+                "nodes_to_exclude": extra_options.get("int8_nodes_to_exclude", []),
+                "algo_config": int8_algo_config,
             },
             "use_qdq": extra_options.get("use_qdq", False),
         }
@@ -472,6 +484,35 @@ class Model:
             int4_algo_config = KQuantWeightOnlyQuantConfig(customized_weight_config=customized_weight_config)
         return int4_algo_config
 
+    def make_int8_algo_config(self, quant_method: str):
+        int8_algo_config = None
+        if quant_method == "default":
+            int8_algo_config = DefaultWeightOnlyQuantConfig(bits=8)
+        if quant_method == "rtn":
+            int8_algo_config = RTNWeightOnlyQuantConfig()
+        elif quant_method in {"k_quant_mixed", "k_quant_last"}:
+            from onnxruntime.quantization.matmul_nbits_quantizer import KQuantWeightOnlyQuantConfig
+            if quant_method == "k_quant_mixed":
+                # k_quant_mixed is from llama.cpp.
+                # Reference: https://github.com/ggml-org/llama.cpp/blob/36667c8edcded08063ed51c7d57e9e086bbfc903/src/llama-quant.cpp#L136
+                # We also consider some MatMuls are more senstive to quantization than other MatMuls.
+                layers_to_exclude = [
+                    i
+                    for i in range(self.num_layers)
+                    if i < self.num_layers / 8 or i >= 7 * self.num_layers / 8 or (i - (round)(self.num_layers / 8)) % 3 == 2
+                ]
+                customized_weight_config = {}
+                for i in layers_to_exclude:
+                    customized_weight_config["/model/layers." + str(i) + "/attn/qkv_proj/MatMul"] = {"bits": 8}
+                    customized_weight_config["/model/layers." + str(i) + "/mlp/down_proj/MatMul"] = {"bits": 8}
+                    # Gemma model
+                    customized_weight_config["/model/layers." + str(i) + "/attn/v_proj/MatMul"] = {"bits": 8}
+                customized_weight_config["/lm_head/MatMul"] = {"bits": 8}
+            elif quant_method == "k_quant_last":
+                customized_weight_config = {"/lm_head/MatMul": {"bits": 8}}
+            int8_algo_config = KQuantWeightOnlyQuantConfig(customized_weight_config=customized_weight_config)
+        return int8_algo_config
+
     def to_int4(self) -> ir.Model:
         quant = MatMulNBitsQuantizer(
             model=ir.to_proto(self.model),
@@ -482,6 +523,20 @@ class Model:
             quant_format=QuantFormat.QDQ if self.quant_attrs["use_qdq"] else QuantFormat.QOperator,
             op_types_to_quantize=self.quant_attrs["int4"]["op_types_to_quantize"],
             algo_config=self.quant_attrs["int4"]["algo_config"],
+        )
+        quant.process()
+        return ir.from_proto(quant.model.model)
+
+    def to_int8(self) -> ir.Model:
+        quant = MatMulNBitsQuantizer(
+            model=ir.to_proto(self.model),
+            block_size=self.quant_attrs["int8"]["block_size"],
+            is_symmetric=self.quant_attrs["int8"]["is_symmetric"],
+            accuracy_level=self.quant_attrs["int8"]["accuracy_level"],
+            nodes_to_exclude=self.quant_attrs["int8"]["nodes_to_exclude"],
+            quant_format=QuantFormat.QDQ if self.quant_attrs["use_qdq"] else QuantFormat.QOperator,
+            op_types_to_quantize=self.quant_attrs["int8"]["op_types_to_quantize"],
+            algo_config=self.quant_attrs["int8"]["algo_config"],
         )
         quant.process()
         return ir.from_proto(quant.model.model)
@@ -804,6 +859,11 @@ class Model:
                 return self.make_matmul_int4_qdq(matmul, basename, root_input, **kwargs)
             else:
                 return self.make_matmul_int4(matmul, basename, root_input, **kwargs)
+        elif self.onnx_dtype in {ir.DataType.INT8, ir.DataType.UINT8}:
+            if self.quant_attrs["use_qdq"]:
+                return self.make_matmul_int8_qdq(matmul, basename, root_input, **kwargs)
+            else:
+                return self.make_matmul_int8(matmul, basename, root_input, **kwargs)
         else:
             raise NotImplementedError(f"The {self.onnx_dtype} precision is not currently supported.")
 
@@ -852,6 +912,44 @@ class Model:
             bits=matmul.bits, block_size=matmul.group_size, K=matmul.in_features, N=matmul.out_features,
         )
         self.make_value(output, self.io_dtype, shape=['batch_size', 'sequence_length', matmul.out_features])
+
+        return name
+
+    def make_matmul_int8(self, matmul, basename, root_input, **kwargs):
+        if not hasattr(matmul, "qweight"):
+            # Fallback to float if quantized weights are not available
+            return self.make_matmul_float(matmul, basename, root_input, **kwargs)
+
+        name = f"{basename}Int8"
+
+        # Save quantized weights and parameters
+        weight = name[1:].replace("/", ".") + ".qweight"
+        self.make_initializer(matmul.qweight, weight, to=ir.DataType.INT8)
+
+        scale = name[1:].replace("/", ".") + ".scale"
+        self.make_initializer(matmul.scale, scale, to=self.io_dtype)
+
+        zero_point = name[1:].replace("/", ".") + ".zero_point"
+        self.make_initializer(matmul.zero_point, zero_point, to=ir.DataType.UINT8 if self.onnx_dtype == ir.DataType.UINT8 else ir.DataType.INT8)
+
+        inputs = [root_input, weight, scale, zero_point]
+
+        output = "logits" if kwargs.get("logits", False) else f"{name}/output_0"
+
+        self.make_node(
+            "MatMulIntegerNBits",  # Or a custom node like "MatMulInt8", depending on your ONNX op set
+            inputs=inputs,
+            outputs=[output],
+            name=name,
+            domain="com.microsoft",  # Adjust if using a different ONNX domain or extension
+            accuracy_level=self.quant_attrs.get("int8", {}).get("accuracy_level", 1),
+            bits=8,
+            block_size=matmul.group_size if hasattr(matmul, "group_size") else 1,
+            K=matmul.in_features,
+            N=matmul.out_features,
+        )
+
+        self.make_value(output, self.io_dtype, shape=["batch_size", "sequence_length", matmul.out_features])
 
         return name
 
@@ -964,6 +1062,8 @@ class Model:
             return self.make_packed_matmul_float(q_matmul, k_matmul, v_matmul, basename, root_input, **kwargs)
         elif self.onnx_dtype in {ir.DataType.INT4, ir.DataType.UINT4}:
             return self.make_packed_matmul_int4(q_matmul, k_matmul, v_matmul, basename, root_input, **kwargs)
+        elif self.onnx_dtype in {ir.DataType.INT8, ir.DataType.UINT8}:
+            return self.make_packed_matmul_int8(q_matmul, k_matmul, v_matmul, basename, root_input, **kwargs)
         else:
             raise NotImplementedError(f"The {self.onnx_dtype} precision is not currently supported.")
 
@@ -1005,6 +1105,26 @@ class Model:
                 self.group_size = q_matmul.group_size
         matmul = PackedMatMul()
         new_name = self.make_matmul_int4(matmul, basename, root_input, **kwargs)
+
+        return new_name
+
+    def make_packed_matmul_int8(self, q_matmul, k_matmul, v_matmul, basename, root_input, **kwargs):
+        if not hasattr(q_matmul, "qweight"):
+            # Fallback to float if INT8 weights aren't available yet
+            return self.make_packed_matmul_float(q_matmul, k_matmul, v_matmul, basename, root_input, **kwargs)
+
+        class PackedMatMul:
+            def __init__(self):
+                self.qweight = torch.cat([q_matmul.qweight, k_matmul.qweight, v_matmul.qweight], dim=0)
+                self.scale = torch.cat([q_matmul.scale, k_matmul.scale, v_matmul.scale], dim=0)
+                self.zero_point = torch.cat([q_matmul.zero_point, k_matmul.zero_point, v_matmul.zero_point], dim=0)
+
+                self.in_features = q_matmul.in_features
+                self.out_features = q_matmul.out_features + k_matmul.out_features + v_matmul.out_features
+                self.dtype = torch.int8  # Or torch.uint8 depending on your implementation
+
+        matmul = PackedMatMul()
+        new_name = self.make_matmul_int8(matmul, basename, root_input, **kwargs)
 
         return new_name
 
@@ -3623,7 +3743,7 @@ def check_extra_options(kv_pairs):
     """
     Check key-value pairs and set values correctly
     """
-    bools = ["int4_is_symmetric", "exclude_embeds", "exclude_lm_head", "include_hidden_states", "enable_cuda_graph", "use_8bits_moe", "use_qdq", "use_webgpu_fp32"]
+    bools = ["int4_is_symmetric", "int8_is_symmetric", "exclude_embeds", "exclude_lm_head", "include_hidden_states", "enable_cuda_graph", "use_8bits_moe", "use_qdq", "use_webgpu_fp32"]
     for key in bools:
         if key in kv_pairs:
             if kv_pairs[key] in {"false", "False", "0"}:
@@ -3639,11 +3759,23 @@ def check_extra_options(kv_pairs):
             op_types_to_quantize += (op_type, )
         kv_pairs["int4_op_types_to_quantize"] = op_types_to_quantize
 
+    if "int8_op_types_to_quantize" in kv_pairs:
+        op_types_to_quantize = ()
+        for op_type in kv_pairs["int8_op_types_to_quantize"].split("/"):
+            op_types_to_quantize += (op_type, )
+        kv_pairs["int8_op_types_to_quantize"] = op_types_to_quantize
+
     if "int4_nodes_to_exclude" in kv_pairs:
         nodes_to_exclude = []
         for node in kv_pairs["int4_nodes_to_exclude"].split(","):
             nodes_to_exclude.append(node)
         kv_pairs["int4_nodes_to_exclude"] = nodes_to_exclude
+
+    if "int8_nodes_to_exclude" in kv_pairs:
+        nodes_to_exclude = []
+        for node in kv_pairs["int8_nodes_to_exclude"].split(","):
+            nodes_to_exclude.append(node)
+        kv_pairs["int8_nodes_to_exclude"] = nodes_to_exclude
 
     if "exclude_lm_head" in kv_pairs and "include_hidden_states" in kv_pairs:
         # 'exclude_lm_head' is for when 'hidden_states' are outputted and 'logits' are not outputted
@@ -3706,6 +3838,11 @@ def set_onnx_dtype(precision: str, extra_options: dict[str, Any]) -> ir.DataType
             return ir.DataType.INT4
         else:
             return ir.DataType.UINT4
+    elif precision == "int8":
+        if extra_options.get("int8_is_symmetric", True):
+            return ir.DataType.INT8
+        else:
+            return ir.DataType.UINT8
     return {
         "fp32": ir.DataType.FLOAT,
         "fp16": ir.DataType.FLOAT16,
@@ -3852,7 +3989,7 @@ def get_args():
         "-p",
         "--precision",
         required=True,
-        choices=["int4", "bf16", "fp16", "fp32"],
+        choices=["int4", "int8", "bf16", "fp16", "fp32"],
         help="Precision of model",
     )
 
